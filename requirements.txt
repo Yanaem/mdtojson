@@ -1,3 +1,4 @@
 supabase
 anthropic
 python-dotenv
+google-cloud-storage
