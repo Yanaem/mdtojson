@@ -16,10 +16,7 @@ Variables d'environnement requises:
     SUPABASE_SERVICE_ROLE_KEY=<votre_service_role_key>
     ANTHROPIC_API_KEY=<votre_anthropic_api_key>
 
-Variables optionnelles pour le prompt :
-    PROMPT_GCS_URI=gs://bucket/path/prompt.txt   # priorité 1
-    PROMPT_CONTENT="..."                         # priorité 2
-    (sinon fallback table claude_prompts)
+    PROMPT_GCS_URI=gs://bucket/path/prompt.txt   # OBLIGATOIRE, aucun fallback
 """
 
 import os
@@ -41,11 +38,11 @@ except ImportError as e:
     print("Installez les dépendances avec: pip install supabase anthropic python-dotenv google-cloud-storage")
     sys.exit(1)
 
-# google-cloud-storage est optionnel : on ne l'utilise que si PROMPT_GCS_URI est défini
+# google-cloud-storage est obligatoire pour PROMPT_GCS_URI
 try:
     from google.cloud import storage  # type: ignore
 except ImportError:
-    storage = None  # On gérera l'absence proprement plus bas
+    storage = None
 
 # Configuration du logging
 logging.basicConfig(
@@ -82,6 +79,11 @@ class OCRAnalyzer:
             raise ValueError("SUPABASE_SERVICE_ROLE_KEY non défini")
         if not ANTHROPIC_API_KEY:
             raise ValueError("ANTHROPIC_API_KEY non défini")
+
+        if storage is None:
+            raise ValueError(
+                "google-cloud-storage n'est pas installé alors que PROMPT_GCS_URI est requis"
+            )
 
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
         self.anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -199,13 +201,13 @@ class OCRAnalyzer:
         return response.data
 
     # ------------------------------------------------------------------ #
-    #  Gestion du prompt (GCS / env / Supabase)
+    #  Gestion du prompt (PROMPT_GCS_URI uniquement)
     # ------------------------------------------------------------------ #
 
     def _load_prompt_from_gcs(self, uri: str) -> str:
         """
-        Charge le prompt depuis un objet GCS de type gs://bucket/chemin/prompt.txt
-        Utilisé quand PROMPT_GCS_URI est défini.
+        Charge le prompt depuis un objet GCS de type gs://bucket/chemin/prompt.txt.
+        PROMPT_GCS_URI est OBLIGATOIRE. Pas de fallback.
         """
         if not uri.startswith("gs://"):
             raise ValueError(
@@ -214,7 +216,7 @@ class OCRAnalyzer:
 
         if storage is None:
             raise ValueError(
-                "google-cloud-storage n'est pas installé, impossible de lire PROMPT_GCS_URI"
+                "google-cloud-storage n'est pas disponible, impossible de lire PROMPT_GCS_URI"
             )
 
         without_scheme = uri[5:]
@@ -238,53 +240,26 @@ class OCRAnalyzer:
         if not blob.exists():
             raise ValueError(f"Prompt introuvable dans GCS à l'URI {uri}")
 
-        return blob.download_as_text(encoding="utf-8")
+        prompt = blob.download_as_text(encoding="utf-8")
+        logger.info("Prompt GCS chargé (%d caractères)", len(prompt))
+        return prompt
 
     def get_default_prompt(self) -> str:
         """
         Récupère le prompt par défaut.
 
-        Priorité :
-          1) PROMPT_GCS_URI (gs://bucket/objet)
-          2) PROMPT_CONTENT (texte direct)
-          3) Table Supabase 'claude_prompts' (Full Analysis Prompt Supplier)
+        ⚠️ Comportement strict :
+          - PROMPT_GCS_URI est OBLIGATOIRE
+          - AUCUN fallback vers PROMPT_CONTENT ou Supabase
         """
-        # 1) Prompt depuis GCS
         gcs_uri = os.getenv("PROMPT_GCS_URI")
-        if gcs_uri:
-            logger.info("Récupération du prompt via PROMPT_GCS_URI")
-            prompt = self._load_prompt_from_gcs(gcs_uri)
-            logger.info("Prompt GCS chargé (%d caractères)", len(prompt))
-            return prompt
+        if not gcs_uri:
+            raise ValueError(
+                "PROMPT_GCS_URI n'est pas défini dans les variables d'environnement. "
+                "Ce script exige un prompt stocké dans GCS (aucun fallback)."
+            )
 
-        # 2) Prompt direct via variable d'environnement
-        env_prompt = os.getenv("PROMPT_CONTENT")
-        if env_prompt:
-            logger.info("Récupération du prompt via PROMPT_CONTENT (env)")
-            logger.info("Prompt env chargé (%d caractères)", len(env_prompt))
-            return env_prompt
-
-        # 3) Fallback : prompt Supabase
-        logger.info(
-            "PROMPT_GCS_URI/PROMPT_CONTENT non définis, utilisation du prompt Supabase "
-            "'Full Analysis Prompt Supplier'"
-        )
-
-        response = (
-            self.supabase.table("claude_prompts")
-            .select("*")
-            .eq("prompt_name", "Full Analysis Prompt Supplier")
-            .eq("is_active", True)
-            .single()
-            .execute()
-        )
-
-        if not response.data:
-            raise ValueError("Prompt 'Full Analysis Prompt Supplier' non trouvé")
-
-        prompt = response.data["prompt_content"]
-        logger.info("Prompt Supabase chargé (%d caractères)", len(prompt))
-        return prompt
+        return self._load_prompt_from_gcs(gcs_uri)
 
     def get_pcg_accounts(self, account_class: int = 6) -> str:
         """Récupère les comptes du PCG Standard pour une classe donnée."""
@@ -573,7 +548,7 @@ class OCRAnalyzer:
             )
         else:
             prompt = self.get_default_prompt()
-            logger.info("Utilisation du prompt par défaut")
+            logger.info("Utilisation du prompt PROMPT_GCS_URI (par défaut)")
 
         # 7. Injecter les variables dynamiques (activité, société, PCG)
         prompt = self.inject_variables(prompt, company)
@@ -630,6 +605,7 @@ Variables d'environnement:
     SUPABASE_URL              URL du projet Supabase
     SUPABASE_SERVICE_ROLE_KEY Clé service role Supabase
     ANTHROPIC_API_KEY         Clé API Anthropic
+    PROMPT_GCS_URI            URI GCS du prompt OBLIGATOIRE
         """,
     )
 
