@@ -53,7 +53,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 
 # Modèle Claude par défaut (même que l'edge function)
-DEFAULT_MODEL = "claude-sonnet-4-5-20250514"
+DEFAULT_MODEL = "claude-sonnet-4-5"
 
 # Retry configuration
 MAX_RETRIES = 3
