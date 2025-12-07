@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import os
-import sys
 import json
 import logging
+import datetime as dt
+
+from google.cloud import storage
 
 from ocr_analysis import OCRAnalyzer, DEFAULT_MODEL
 
@@ -15,75 +17,98 @@ logger = logging.getLogger(__name__)
 
 
 def get_markdown_content(analyzer: OCRAnalyzer) -> str:
-    """
-    Récupère le markdown à analyser.
-
-    Priorité :
-      1. MARKDOWN_PATH  -> chemin dans le bucket Supabase 'markdown-files'
-      2. MARKDOWN       -> markdown brut passé en variable d'environnement
-
-    Si rien n'est fourni -> exit(1).
-    """
+    """Récupère le markdown à analyser."""
     markdown_path = os.getenv("MARKDOWN_PATH")
     if markdown_path:
-        logger.info("Utilisation du markdown depuis Supabase Storage: %s", markdown_path)
+        logger.info("Markdown via Supabase Storage: %s", markdown_path)
         return analyzer.download_markdown(markdown_path)
 
     markdown_env = os.getenv("MARKDOWN")
     if markdown_env:
-        logger.info("Utilisation du markdown depuis la variable d'environnement MARKDOWN")
+        logger.info("Markdown via variable d'environnement MARKDOWN")
         return markdown_env
 
     raise SystemExit(
         "Aucun markdown fourni. "
-        "Définis soit MARKDOWN_PATH (chemin dans 'markdown-files'), "
-        "soit MARKDOWN (contenu markdown brut)."
+        "Définis MARKDOWN_PATH (chemin dans 'markdown-files') "
+        "ou MARKDOWN (contenu brut)."
     )
 
 
+def compute_gcs_object_name() -> str:
+    """Détermine le nom du fichier JSON dans le bucket GCS."""
+    # 1. Nom imposé par variable d'env
+    explicit = os.getenv("GCS_OBJECT")
+    if explicit:
+        return explicit
+
+    # 2. Dériver du MARKDOWN_PATH si présent
+    markdown_path = os.getenv("MARKDOWN_PATH")
+    if markdown_path:
+        base = os.path.basename(markdown_path)
+        if base.lower().endswith(".md"):
+            base = base[:-3]
+        return f"{base}.json"
+
+    # 3. Fallback : nom horodaté
+    ts = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    return f"result-{ts}.json"
+
+
+def upload_json_to_gcs(json_data: dict) -> str:
+    """Upload du JSON dans le bucket GCS. Retourne le chemin 'bucket/objet'."""
+    bucket_name = os.getenv("GCS_BUCKET", "mdtojson")
+    object_name = compute_gcs_object_name()
+
+    logger.info("Upload du JSON vers GCS: bucket=%s, object=%s", bucket_name, object_name)
+
+    # client GCS (utilise le service account du job Cloud Run)
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_name)
+
+    payload = json.dumps(json_data, ensure_ascii=False, indent=2)
+    blob.upload_from_string(payload, content_type="application/json")
+
+    full_path = f"gs://{bucket_name}/{object_name}"
+    logger.info("JSON écrit dans %s", full_path)
+    return full_path
+
+
 def main() -> int:
-    # DRY_RUN garde la même logique (utile plus tard si on veut réécrire en base)
     dry_run_env = os.getenv("DRY_RUN", "false").lower()
     dry_run = dry_run_env in ("1", "true", "yes", "y")
-
-    # Permet d'override le modèle via variable d'env
     model = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
 
     try:
-        logger.info("Initialisation de OCRAnalyzer (mode markdown direct)")
+        logger.info("Init OCRAnalyzer (mode markdown direct)")
         analyzer = OCRAnalyzer(dry_run=dry_run, model=model)
 
-        # 1. Récupérer le markdown
         markdown_content = get_markdown_content(analyzer)
         logger.info("Markdown chargé (%d caractères)", len(markdown_content))
 
-        # 2. Récupérer éventuellement l'entreprise pour injecter l'activité dans le prompt
         company = None
         company_id = os.getenv("COMPANY_ID")
         if company_id:
-            logger.info("Récupération de l'entreprise %s pour injection dans le prompt", company_id)
             company = analyzer.get_company(company_id)
 
-        # 3. Récupérer le prompt principal dans la table claude_prompts
         prompt = analyzer.get_default_prompt()
-
-        # 4. Injection des variables (activité, nom de la société, etc.)
         prompt = analyzer.inject_variables(prompt, company)
 
-        # 5. Appel Claude
         text_response, usage = analyzer.call_claude(prompt, markdown_content)
-
-        # 6. Parsing du JSON renvoyé par Claude
         json_data = analyzer.parse_json_response(text_response)
 
-        # ⚠️ On n'écrit rien en base ici : on renvoie juste le JSON
-        # On affiche UNIQUEMENT le JSON sur stdout
+        # 1) Upload dans GCS
+        gcs_path = upload_json_to_gcs(json_data)
+
+        # 2) On garde le print pour debug si besoin
         print(json.dumps(json_data, ensure_ascii=False, indent=2))
 
         logger.info(
-            "Job mdtojson terminé avec succès (input_tokens=%s, output_tokens=%s)",
+            "mdtojson OK (input_tokens=%s, output_tokens=%s, gcs_path=%s)",
             usage.get("input_tokens"),
             usage.get("output_tokens"),
+            gcs_path,
         )
         return 0
 
